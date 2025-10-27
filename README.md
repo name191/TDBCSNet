@@ -34,3 +34,16 @@ url = {https://www.sciencedirect.com/science/article/pii/S0952197625005366},
 author = {Jianming Zhang and Dianwen Li and Zhigao Zeng and Rui Zhang and Jin Wang}
 }
  ```
+```bibtex
+@article{ZHANG2026119180,
+title = {Topology-aware dual-branch network via lightweight Mamba for crack segmentation and quantification},
+journal = {Measurement},
+volume = {258},
+pages = {119180},
+year = {2026},
+issn = {0263-2241},
+doi = {https://doi.org/10.1016/j.measurement.2025.119180},
+url = {https://www.sciencedirect.com/science/article/pii/S0263224125025394},
+author = {Jianming Zhang and Dianwen Li and Shigen Zhang and Rui Zhang and Jin Zhang},
+}
+```
