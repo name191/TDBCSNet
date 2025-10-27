@@ -3,38 +3,22 @@ import os
 import sys
 import time
 import argparse
-
 import pandas
 from tqdm import tqdm
-
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 from torch.nn.parallel import DistributedDataParallel
-
-from clear_log import clear_emptyfile
 from dataloader.crackDatasets import crackDataset
-from dataloader.dataloader import get_train_loader
 from models.builder import EncoderDecoder as segmodel
-from dataloader.RGBXDataset import RGBXDataset
-from dataloader.dataloader import ValPre
 from utils import metrics_crack
-from utils.init_func import init_weight, group_weight
+from utils.init_func import group_weight
 from utils.loss_crack import SoftDiceLoss
 from utils.lr_policy import WarmUpPolyLR
 from engine.engine import Engine
-from engine.logger import get_logger
 from utils.pyt_utils import all_reduce_tensor
-from utils.pyt_utils import ensure_dir, link_file, load_model, parse_devices
-from utils.visualize import print_iou, show_img
 from engine.logger import get_logger
-from utils.metric import hist_info, compute_score
-from eval import SegEvaluator
-import shutil
-
-import utils.metrics_crack
-
 from tensorboardX import SummaryWriter
 
 
@@ -45,10 +29,6 @@ def main(config):
     parser = argparse.ArgumentParser()
     with Engine(custom_parser=parser) as engine:
         args = parser.parse_args()
-        print(args)
-
-        # from configs.config_crack import config
-
         print("=======================================")
         print(config.tb_dir)
         print("=======================================")
@@ -61,27 +41,22 @@ def main(config):
         if torch.cuda.is_available():
             torch.cuda.manual_seed(seed)
 
-        # data loader
-        # train_loader, train_sampler = get_train_loader(engine, RGBXDataset, config)
-
         if config.dataset_name == 'Deepcrack':
-            root = "/home/Deepcrack/"
+            root = "./data/Deepcrack/"
         elif config.dataset_name == 'crack260':
-            root = "/home/crack260/"
+            root = "./data/crack260/"
         elif config.dataset_name == 'CFD':
-            root = "/home/CrackForest/"
+            root = "./data/CrackForest/"
         elif config.dataset_name == 'Crack315':
-            root = "/home/Crack315/"
+            root = "./data/Crack315/"
 
         batchsize = config.batch_size
         outnum = 1
 
         trainset = crackDataset(root, txt="train.txt")
-        # trainset = Dataset(root, mode="train.txt", savepath=savepath)
         train_loader = torch.utils.data.DataLoader(trainset, batch_size=batchsize,
                                                    shuffle=True, num_workers=4, drop_last=True)
 
-        # testset = Dataset(root, mode="test.txt", savepath=savepath)
         val_dataset = crackDataset(root, txt="test.txt")
         val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=1,
                                                  shuffle=False, num_workers=4, drop_last=True)
@@ -91,9 +66,6 @@ def main(config):
             generate_tb_dir = config.tb_dir + '/tb'
             tb = SummaryWriter(log_dir=tb_dir)
             engine.link_tb(tb_dir, generate_tb_dir)
-
-        # config network and criterion
-        # criterion = nn.CrossEntropyLoss(reduction='mean', ignore_index=config.background)
 
         criterion = SoftDiceLoss()
 
@@ -147,11 +119,9 @@ def main(config):
 
         describepath = os.path.join(config.log_dir, "describe.txt")
         with open(describepath, "w") as f:
-            f.write("en=" + config.backbone + "\n" + "de=" + config.decoder+ "\n" + "lr=" + str(config.lr)+ "\n" + "epoch=" + str(config.nepochs))
+            f.write("en=" + config.backbone + "\n" + "de=" + config.decoder+ "\n" + "lr=" + str(config.lr)+ "\n")
             f.close()
         for epoch in range(engine.state.epoch, config.real_nepochs + 1):
-            # if engine.distributed:
-            #     train_sampler.set_epoch(epoch)
             bar_format = '{desc}[{elapsed}<{remaining},{rate_fmt}]'
             pbar = tqdm(range(config.niters_per_epoch), file=sys.stdout,
                         bar_format=bar_format)
@@ -163,18 +133,12 @@ def main(config):
                 engine.update_iteration(epoch, idx)
 
                 (imgs, gts) = next(dataloader)
-                # imgs = minibatch['data']
-                # gts = minibatch['label']
-                # modal_xs = minibatch['modal_x']
 
                 imgs = imgs.cuda(non_blocking=True)
                 gts = gts.cuda(non_blocking=True)
-                # modal_xs = modal_xs.cuda(non_blocking=True)
 
-                aux_rate = 0.2
                 loss = model(imgs, gts)
 
-                # reduce the whole loss over multi-gpu
                 if engine.distributed:
                     reduce_loss = all_reduce_tensor(loss, world_size=engine.world_size)
 
@@ -191,14 +155,14 @@ def main(config):
                 if engine.distributed:
                     if dist.get_rank() == 0:
                         sum_loss += reduce_loss.item()
-                        print_str = 'Epoch {}/{}'.format(epoch, config.nepochs) \
+                        print_str = 'Epoch {}/{}'.format(epoch, config.real_nepochs) \
                                     + ' Iter {}/{}:'.format(idx + 1, config.niters_per_epoch) \
                                     + ' lr=%.4e' % lr \
                                     + ' loss=%.4f total_loss=%.4f' % (reduce_loss.item(), (sum_loss / (idx + 1)))
                         pbar.set_description(print_str, refresh=False)
                 else:
                     sum_loss += loss
-                    print_str = 'Epoch {}/{}'.format(epoch, config.nepochs) \
+                    print_str = 'Epoch {}/{}'.format(epoch, config.real_nepochs) \
                                 + ' Iter {}/{}:'.format(idx + 1, config.niters_per_epoch) \
                                 + ' lr=%.4e' % lr \
                                 + ' loss=%.4f total_loss=%.4f' % (loss, (sum_loss / (idx + 1)))
@@ -219,124 +183,86 @@ def main(config):
                                                     config.log_dir,
                                                     config.log_dir_link)
 
-            # devices_val = [engine.local_rank] if engine.distributed else [0]
             torch.cuda.empty_cache()
-            if engine.distributed:
-                if dist.get_rank() == 0:
-                    # only test on rank 0, otherwise there would be some synchronization problems
-                    # evaluation to decide whether to save the model
-                    if (epoch >= config.checkpoint_start_epoch) and (
-                            epoch - config.checkpoint_start_epoch) % config.checkpoint_step == 0:
-                        model.eval()
-                        with torch.no_grad():
-                            all_dev = parse_devices(args.devices)
+            if (epoch >= config.checkpoint_start_epoch) and (
+                    epoch - config.checkpoint_start_epoch) % config.checkpoint_step == 0:
+                bar2 = tqdm(enumerate(val_loader), total=len(val_loader))
+                bar2.set_description('Epoch %d --- eval --- :' % epoch)
+                model.eval()
+                with torch.no_grad():
+                    loss = 0
+                    acc = 0
+                    precision = 0
+                    recall = 0
+                    f1 = 0
+                    iou = 0
+                    miou = 0
+                    for idx, (img, label) in bar2:
+                        img = img.to(device)
+                        label = label.to(device)
+                        if outnum == 5:
+                            pred_output, out1, out2, out3, out4, out5 = model(img)
+                            val_loss = criterion(pred_output.view(-1, 1), label.view(-1, 1)) / batchsize
+                        elif outnum == 2:
+                            pred_output, pout1 = model(img)
+                            val_loss = criterion(pred_output.view(-1, 1), label.view(-1, 1)) + criterion(
+                                pout1.view(-1, 1),
+                                label.view(-1, 1))
 
-                            # network = segmodel(cfg=config, criterion=None, norm_layer=nn.BatchNorm2d).cuda(all_dev[0])
-                            segmentor = SegEvaluator(dataset=val_dataset, class_num=config.num_classes,
-                                                     norm_mean=config.norm_mean, norm_std=config.norm_std,
-                                                     network=model, multi_scales=config.eval_scale_array,
-                                                     is_flip=config.eval_flip, devices=[model.device],
-                                                     verbose=False,
-                                                     )
-                            _, mean_IoU = segmentor.run(config.checkpoint_dir, str(epoch), config.val_log_file,
-                                                        config.link_val_log_file)
-                            print('mean_IoU:', mean_IoU)
+                        elif outnum == 1:
+                            pred_output = model(img)
+                            val_loss = criterion(pred_output.view(-1, 1), label.view(-1, 1)) / batchsize
 
-                            # Determine if the model performance improved
-                            if mean_IoU > best_mean_iou:
-                                # If the model improves, remove the saved checkpoint for this epoch
-                                checkpoint_path = os.path.join(config.checkpoint_dir, f'epoch-{best_epoch}.pth')
-                                if os.path.exists(checkpoint_path):
-                                    os.remove(checkpoint_path)
-                                best_epoch = epoch
-                                best_mean_iou = mean_IoU
-                            else:
-                                # If the model does not improve, remove the saved checkpoint for this epoch
-                                checkpoint_path = os.path.join(config.checkpoint_dir, f'epoch-{epoch}.pth')
-                                if os.path.exists(checkpoint_path):
-                                    os.remove(checkpoint_path)
+                        loss += val_loss
 
-                        model.train()
-            else:
-                if (epoch >= config.checkpoint_start_epoch) and (
-                        epoch - config.checkpoint_start_epoch) % config.checkpoint_step == 0:
-                    bar2 = tqdm(enumerate(val_loader), total=len(val_loader))
-                    bar2.set_description('Epoch %d --- eval --- :' % epoch)
-                    model.eval()
-                    with torch.no_grad():
-                        loss = 0
-                        acc = 0
-                        precision = 0
-                        recall = 0
-                        f1 = 0
-                        iou = 0
-                        miou = 0
-                        for idx, (img, label) in bar2:
-                            img = img.to(device)
-                            label = label.to(device)
-                            if outnum == 5:
-                                pred_output, out1, out2, out3, out4, out5 = model(img)
-                                val_loss = criterion(pred_output.view(-1, 1), label.view(-1, 1)) / batchsize
-                            elif outnum == 2:
-                                pred_output, pout1 = model(img)
-                                val_loss = criterion(pred_output.view(-1, 1), label.view(-1, 1)) + criterion(
-                                    pout1.view(-1, 1),
-                                    label.view(-1, 1))
+                        pred = torch.sigmoid(pred_output)
+                        # pred = pred_output
+                        ac, p, r, f, = metrics_crack.f1_loss(label[0], pred)
+                        acc += ac
+                        precision += p
+                        recall += r
+                        f1 += f
+                        i, _ = metrics_crack.iou_score(pred, label[0])
+                        iou += i
+                        mi = metrics_crack.miou(pred, label[0])
+                        miou += mi
+                    # [acc,precision,recall,f1,mIoU]
+                    l = len(val_loader)
+                    acclist = [acc / l * 100, precision / l * 100, recall / l * 100, f1 / l * 100, iou / l * 100,
+                               miou / l * 100, loss.item() / l * 100, epoch]
+                    vallosslist = [loss.item() / len(val_loader) * 100]
+                    print("valloss", vallosslist)
+                    data_valloss = pandas.DataFrame([vallosslist])
+                    data_valloss.to_csv(config.log_dir + '/valloss.csv', mode='a', header=False, index=False)
+                    print("acc", acclist)
+                    data_acc = pandas.DataFrame([acclist])
+                    data_acc.to_csv(config.log_dir + '/acc.csv', mode='a', header=False, index=False)
+                    all_acc=pandas.read_csv(config.log_dir + '/acc.csv',header=None)
+                    sort_all_acc=all_acc.sort_values(by=all_acc.columns[-3],ascending=False)
+                    sort_all_acc.to_csv(config.log_dir + '/acc_sort.csv',header=False, index=False)
 
-                            elif outnum == 1:
-                                pred_output = model(img)
-                                val_loss = criterion(pred_output.view(-1, 1), label.view(-1, 1)) / batchsize
+                    mean_IoU = miou / l * 100
+                    print('mean_IoU:', mean_IoU)
 
-                            loss += val_loss
-
-                            pred = torch.sigmoid(pred_output)
-                            # pred = pred_output
-                            ac, p, r, f, = metrics_crack.f1_loss(label[0], pred)
-                            acc += ac
-                            precision += p
-                            recall += r
-                            f1 += f
-                            i, _ = metrics_crack.iou_score(pred, label[0])
-                            iou += i
-                            mi = metrics_crack.miou(pred, label[0])
-                            miou += mi
-                        # [acc,precision,recall,f1,mIoU]
-                        l = len(val_loader)
-                        acclist = [acc / l * 100, precision / l * 100, recall / l * 100, f1 / l * 100, iou / l * 100,
-                                   miou / l * 100, loss.item() / l * 100, epoch]
-                        vallosslist = [loss.item() / len(val_loader) * 100]
-                        print("valloss", vallosslist)
-                        data_valloss = pandas.DataFrame([vallosslist])
-                        data_valloss.to_csv(config.log_dir + '/valloss.csv', mode='a', header=False, index=False)
-                        print("acc", acclist)
-                        data_acc = pandas.DataFrame([acclist])
-                        data_acc.to_csv(config.log_dir + '/acc.csv', mode='a', header=False, index=False)
-                        all_acc=pandas.read_csv(config.log_dir + '/acc.csv',header=None)
-                        sort_all_acc=all_acc.sort_values(by=all_acc.columns[-3],ascending=False)
-                        sort_all_acc.to_csv(config.log_dir + '/acc_sort.csv',header=False, index=False)
-
-                        mean_IoU = miou / l * 100
-                        print('mean_IoU:', mean_IoU)
-
-                        # Determine if the model performance improved
-                        if mean_IoU > best_mean_iou:
-                            # If the model improves, remove the saved checkpoint for this epoch
-                            checkpoint_path = os.path.join(config.checkpoint_dir, f'epoch-{best_epoch}.pth')
-                            if os.path.exists(checkpoint_path):
-                                os.remove(checkpoint_path)
-                            best_epoch = epoch
-                            best_mean_iou = mean_IoU
-                        else:
-                            # If the model does not improve, remove the saved checkpoint for this epoch
-                            checkpoint_path = os.path.join(config.checkpoint_dir, f'epoch-{epoch}.pth')
-                            if os.path.exists(checkpoint_path):
-                                os.remove(checkpoint_path)
-                    model.train()
+                    # Determine if the model performance improved
+                    if mean_IoU > best_mean_iou:
+                        # If the model improves, remove the saved checkpoint for this epoch
+                        checkpoint_path = os.path.join(config.checkpoint_dir, f'epoch-{best_epoch}.pth')
+                        if os.path.exists(checkpoint_path):
+                            os.remove(checkpoint_path)
+                        best_epoch = epoch
+                        best_mean_iou = mean_IoU
+                    else:
+                        # If the model does not improve, remove the saved checkpoint for this epoch
+                        checkpoint_path = os.path.join(config.checkpoint_dir, f'epoch-{epoch}.pth')
+                        if os.path.exists(checkpoint_path):
+                            os.remove(checkpoint_path)
+                model.train()
 
 if __name__=="__main__":
-    from ablation_config.config_crack_Deepcrack import config
-    for dename in ["myMambaDecoderv2_GN_CGN"]:
-        for enname in ["TCB_projVSS_AFFM","TCB_LightVSS_AFFM_wo"]:
+    from configs.config_crack_Deepcrack import config
+    for dename in ["TDBCSNet_encoder"]:
+        for enname in ["TDBCSNet_decoder"]:
             while (os.path.exists(config.log_dir)):
                 config.log_dir = config.log_dir[:-1] + str(int(config.log_dir[-1]) + 1)
             config.tb_dir = osp.abspath(osp.join(config.log_dir, "tb"))
@@ -344,7 +270,6 @@ if __name__=="__main__":
             config.checkpoint_dir = osp.abspath(osp.join(config.log_dir, "checkpoint"))
             config.backbone = enname
             config.decoder = dename
-            config.nepochs = epoch
 
             main(config)
 
